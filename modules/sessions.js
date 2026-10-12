@@ -1,12 +1,13 @@
 const path = require('path');
 const sqlite3 = require('sqlite3');
+const geoip = require('geoip-lite');
 const { normalizeIp } = require('../handlers/antiVpnAllowlist');
 const loadConfig = require('../handlers/config');
 const settings = loadConfig('./config.toml');
 
 const HeliactylModule = {
   name: 'Sessions',
-  version: '1.1.0',
+  version: '1.1.1',
   api_level: 4,
   target_platform: '10.0.0',
   description: 'Active session management',
@@ -15,34 +16,10 @@ const HeliactylModule = {
     email: "ludo@overnode.fr",
     url: "https://achul123.pages.dev/"
   },
-  dependencies: [],
+  dependencies: ['geoip-lite'],
   tags: ['core'],
   license: 'MIT'
 };
-
-const geoCache = new Map();
-const GEO_CACHE_TTL = 1000 * 60 * 60; // 1 hour for successful location lookups
-const GEO_NEGATIVE_TTL = 1000 * 60 * 2; // 2 minutes for failed/throttled lookups
-const MAX_GEO_CACHE_ENTRIES = 5000;
-
-function pruneGeoCache(now) {
-  if (geoCache.size > MAX_GEO_CACHE_ENTRIES) {
-    for (const [key, entry] of geoCache.entries()) {
-      const ttl = entry.data ? GEO_CACHE_TTL : GEO_NEGATIVE_TTL;
-      if (now - entry.ts > ttl) {
-        geoCache.delete(key);
-      }
-    }
-    if (geoCache.size > MAX_GEO_CACHE_ENTRIES) {
-      const toDelete = geoCache.size - MAX_GEO_CACHE_ENTRIES;
-      let count = 0;
-      for (const key of geoCache.keys()) {
-        geoCache.delete(key);
-        if (++count >= toDelete) break;
-      }
-    }
-  }
-}
 
 function isPrivateIp(rawIp) {
   if (!rawIp) return true;
@@ -56,34 +33,20 @@ function isPrivateIp(rawIp) {
   return false;
 }
 
-async function lookupLocation(rawIp) {
+function lookupLocation(rawIp) {
   if (isPrivateIp(rawIp)) return null;
   const ip = normalizeIp(rawIp) || String(rawIp).trim();
-  const cached = geoCache.get(ip);
-  const now = Date.now();
-  if (cached) {
-    const ttl = cached.data ? GEO_CACHE_TTL : GEO_NEGATIVE_TTL;
-    if (now - cached.ts < ttl) return cached.data;
-  }
   try {
-    const response = await fetch("http://ip-api.com/json/" + encodeURIComponent(ip) + "?fields=status,country,regionName,city", {
-      signal: AbortSignal.timeout(3000)
-    });
-    const data = await response.json();
-    pruneGeoCache(now);
-    if (data.status === 'success') {
-      const location = { country: data.country, region: data.regionName, city: data.city };
-      geoCache.set(ip, { data: location, ts: now });
-      return location;
-    } else {
-      geoCache.set(ip, { data: null, ts: now });
-      return null;
-    }
+    const geo = geoip.lookup(ip);
+    if (!geo) return null;
+    return {
+      country: geo.country || null,
+      region: geo.region || null,
+      city: geo.city || null
+    };
   } catch {
-    pruneGeoCache(now);
-    geoCache.set(ip, { data: null, ts: now });
+    return null;
   }
-  return null;
 }
 
 function getStore(req, app) {
@@ -284,11 +247,9 @@ module.exports.load = async function (app, db) {
       const uniqueIps = [...new Set(sessions.map((s) => s.ip).filter(Boolean))];
       const locationMap = new Map();
 
-      await Promise.all(
-        uniqueIps.map(async (ip) => {
-          locationMap.set(ip, await lookupLocation(ip));
-        })
-      );
+      for (const ip of uniqueIps) {
+        locationMap.set(ip, lookupLocation(ip));
+      }
 
       for (const session of sessions) {
         if (session.ip) {
